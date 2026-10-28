@@ -206,6 +206,11 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# EmoArt source images/annotations are downloaded separately (several GB).
+data/raw/
+data/splits/
+runs/
+
 # PyPI configuration file
 .pypirc
 
