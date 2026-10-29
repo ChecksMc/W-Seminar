@@ -70,13 +70,20 @@ MIT license covers project code only, not EmoArt images or annotations.
 Train the baseline for 15 epochs using the fixed 70/15/15 stratified split:
 
 ```bash
-python -m src.CNN.train
+python -m src.CNN.train --device cpu
 ```
+
+Use `--device nvidia` (or `--device cuda`) to request an NVIDIA GPU, and
+`--device auto` to select an available CUDA device or fall back to CPU. The
+default is `auto`. A forced NVIDIA/CUDA choice raises an error if CUDA is not
+available. The CPU-only PyTorch wheel installed above cannot run CUDA; install
+a CUDA-enabled PyTorch build from the official selector if you later train on
+an NVIDIA system.
 
 Select learning rate and dropout using a small validation-set grid:
 
 ```bash
-python -m src.CNN.train --tune --epochs 8
+python -m src.CNN.train --tune --epochs 8 --device cpu
 ```
 
 The tune grid trains four combinations of learning rate and dropout. Its best
@@ -95,11 +102,12 @@ written to `runs/cnn/`, including `best_model.pt`, `labels.json`, and
 `training_report.json`. Class-weighted loss helps with the strong emotion-class
 imbalance. Report balanced accuracy and macro F1 alongside ordinary accuracy.
 
-The data package includes rare emotion labels with very few examples. If any
-emotion is missing from the training partition, training raises a clear error
-instead of silently learning an impossible class. A random image split can
-still place works by the same artist or style in more than one partition, so
-the score does not establish generalization to unseen artists or cultures.
+The data package includes rare emotion labels with very few examples. Split
+creation moves a sample into the training partition when necessary so that
+every label is learnable; invalid saved splits raise a clear error. A random
+image split can still place works by the same artist or style in more than one
+partition, so the score does not establish generalization to unseen artists or
+cultures.
 
 This small CNN can run on a CPU. An Intel i7 with 32 GB RAM and NVMe storage is
 adequate for a prototype, but training time depends on the exact i7 model and
@@ -112,8 +120,8 @@ modest in memory; the 5.2 GB dataset footprint is the larger storage item.
 After training, show the top five predicted EmoArt emotion categories:
 
 ```bash
-python -m src.CNN.predict path/to/artwork.jpg
-python -m src.CNN.predict path/to/artwork.jpg --top-k 3
+python -m src.CNN.predict path/to/artwork.jpg --device cpu
+python -m src.CNN.predict path/to/artwork.jpg --top-k 3 --device cpu
 ```
 
 The printed probabilities represent the network's confidence over dataset
@@ -124,13 +132,13 @@ labels. They are not calibrated estimates of a viewer's subjective feelings.
 Generate a mouse-rotatable map from known training and validation artworks:
 
 ```bash
-python -m src.CNN.visualize
+python -m src.CNN.visualize --device cpu
 ```
 
 Optionally place a new image into the map using its nearest known artworks:
 
 ```bash
-python -m src.CNN.visualize --image path/to/artwork.jpg --neighbors 12
+python -m src.CNN.visualize --image path/to/artwork.jpg --neighbors 12 --device cpu
 ```
 
 Open `runs/visualization/emotion_space.html` in a browser. Drag to rotate,

@@ -4,6 +4,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import torch
 from PIL import Image
@@ -11,6 +12,7 @@ from torch import Tensor
 from torchvision import transforms
 
 from . import param
+from .device import DeviceSelection, resolve_device
 from .model import ArtEmotionCNN
 
 
@@ -22,6 +24,7 @@ class PredictionArguments:
         image: Artwork file to classify.
         checkpoint: Trained CNN parameter file.
         top_k: Number of highest-probability emotions to print.
+        device: Whether to use CPU, CUDA, or automatic device selection.
 
     Returns:
         An immutable prediction configuration object.
@@ -30,6 +33,7 @@ class PredictionArguments:
     image: Path
     checkpoint: Path
     top_k: int
+    device: DeviceSelection
 
 
 def _parse_arguments() -> PredictionArguments:
@@ -45,11 +49,18 @@ def _parse_arguments() -> PredictionArguments:
     parser.add_argument("image", type=Path)
     parser.add_argument("--checkpoint", type=Path, default=param.OUTPUT_DIR / "best_model.pt")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "nvidia", "cuda"),
+        default="auto",
+        help="Compute device: CPU, NVIDIA/CUDA, or auto-detect",
+    )
     parsed = parser.parse_args()
     return PredictionArguments(
         image=Path(parsed.image),
         checkpoint=Path(parsed.checkpoint),
         top_k=int(parsed.top_k),
+        device=cast(DeviceSelection, parsed.device),
     )
 
 
@@ -94,6 +105,7 @@ def main() -> None:
         FileNotFoundError: If the image, checkpoint, or class-label file is
             missing.
         ValueError: If top-k is invalid or stored class labels are malformed.
+        RuntimeError: If an explicitly requested CUDA device is unavailable.
     """
     arguments = _parse_arguments()
     if not arguments.checkpoint.is_file():
@@ -106,7 +118,7 @@ def main() -> None:
         raise ValueError(f"Invalid emotion labels in {labels_path}")
     if arguments.top_k <= 0 or arguments.top_k > len(labels):
         raise ValueError(f"--top-k must be between 1 and {len(labels)}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(arguments.device)
     model = ArtEmotionCNN(len(labels), embedding_dim=param.EMBEDDING_DIM)
     model.load_state_dict(torch.load(arguments.checkpoint, map_location=device, weights_only=True))
     model.to(device)

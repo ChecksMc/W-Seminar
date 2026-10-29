@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from itertools import product
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from . import param
 from .data import EmoArtDataset, save_or_load_splits, seed_everything
+from .device import DeviceSelection, resolve_device
 from .model import ArtEmotionCNN
 
 
@@ -49,6 +50,7 @@ class TrainArguments:
         batch_size: Number of images per training batch.
         tune: Whether to compare the predefined hyperparameter grid.
         seed: Random seed for data loading and model initialization.
+        device: Whether to use CPU, CUDA, or automatic device selection.
 
     Returns:
         An immutable command-line configuration object.
@@ -58,6 +60,7 @@ class TrainArguments:
     batch_size: int
     tune: bool
     seed: int
+    device: DeviceSelection
 
 
 def _make_loader(
@@ -276,20 +279,27 @@ def _parse_arguments() -> TrainArguments:
         None.
 
     Returns:
-        Namespace containing the requested epoch count, batch size, and tuning
-        flag.
+        Training options including epochs, batch size, tuning flag, random
+        seed, and selected compute device.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--epochs", type=int, default=param.EPOCHS)
     parser.add_argument("--batch-size", type=int, default=param.BATCH_SIZE)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--seed", type=int, default=param.RANDOM_SEED)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "nvidia", "cuda"),
+        default="auto",
+        help="Compute device: CPU, NVIDIA/CUDA, or auto-detect",
+    )
     parsed = parser.parse_args()
     return TrainArguments(
         epochs=int(parsed.epochs),
         batch_size=int(parsed.batch_size),
         tune=bool(parsed.tune),
         seed=int(parsed.seed),
+        device=cast(DeviceSelection, parsed.device),
     )
 
 
@@ -306,7 +316,8 @@ def main() -> None:
         FileNotFoundError: If EmoArt annotations or images are not installed.
         ValueError: If the saved data splits, labels, or training parameters
             are invalid.
-        RuntimeError: If no checkpoint can be selected during training.
+        RuntimeError: If no checkpoint can be selected during training or an
+            explicitly requested CUDA device is unavailable.
     """
     arguments = _parse_arguments()
     seed_everything(arguments.seed)
@@ -323,7 +334,7 @@ def main() -> None:
     if len(class_names) < 2:
         raise ValueError("At least two distinct dominant-emotion labels are required")
     emotion_to_index = {name: index for index, name in enumerate(class_names)}
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(arguments.device)
     configs = (
         _trial_configs(arguments.epochs, arguments.batch_size)
         if arguments.tune
@@ -382,6 +393,7 @@ def main() -> None:
     )
     report: dict[str, Any] = {
         "selected_configuration": asdict(best_config),
+        "device": str(device),
         "validation_macro_f1": best_validation_f1,
         "test_loss": test_loss,
         "test_metrics": test_metrics,

@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from . import param
 from .data import EmoArtDataset, seed_everything
+from .device import DeviceSelection, resolve_device
 from .model import ArtEmotionCNN
 
 FloatArray = NDArray[np.float32]
@@ -36,6 +37,7 @@ class VisualizationArguments:
         clusters: Number of spectral groups assigned from the KNN graph.
         output: Destination HTML file for the interactive plot.
         seed: Random seed used by the spectral projection and clustering.
+        device: Whether to use CPU, CUDA, or automatic device selection.
 
     Returns:
         An immutable visualization configuration object.
@@ -46,6 +48,7 @@ class VisualizationArguments:
     clusters: int
     output: Path
     seed: int
+    device: DeviceSelection
 
 
 def _extract_recognition(
@@ -389,6 +392,12 @@ def _parse_arguments() -> VisualizationArguments:
     parser.add_argument("--clusters", type=int, default=12)
     parser.add_argument("--output", type=Path, default=param.VISUALIZATION_DIR / "emotion_space.html")
     parser.add_argument("--seed", type=int, default=param.RANDOM_SEED)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "nvidia", "cuda"),
+        default="auto",
+        help="Compute device: CPU, NVIDIA/CUDA, or auto-detect",
+    )
     parsed = parser.parse_args()
     return VisualizationArguments(
         image=parsed.image,
@@ -396,6 +405,7 @@ def _parse_arguments() -> VisualizationArguments:
         clusters=int(parsed.clusters),
         output=Path(parsed.output),
         seed=int(parsed.seed),
+        device=cast(DeviceSelection, parsed.device),
     )
 
 
@@ -413,6 +423,7 @@ def main() -> None:
             files are missing.
         ValueError: If split membership, model dimensions, or KNN parameters
             are invalid.
+        RuntimeError: If an explicitly requested CUDA device is unavailable.
     """
     arguments = _parse_arguments()
     seed_everything(arguments.seed)
@@ -430,7 +441,7 @@ def main() -> None:
     known_rows = splits.loc[splits["split"].isin(("train", "validation"))].reset_index(drop=True)
     if known_rows.empty:
         raise ValueError("Saved train and validation splits have no known artworks")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(arguments.device)
     model = ArtEmotionCNN(len(class_names), embedding_dim=param.EMBEDDING_DIM, dropout=param.DROPOUT)
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     model.to(device)
