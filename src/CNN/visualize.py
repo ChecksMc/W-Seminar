@@ -13,7 +13,6 @@ import torch
 from numpy.typing import NDArray
 from scipy import sparse
 from sklearn.cluster import SpectralClustering
-from sklearn.manifold import SpectralEmbedding
 from sklearn.neighbors import NearestNeighbors
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -32,11 +31,11 @@ class VisualizationArguments:
     """Command-line options for generating and querying the emotion map.
 
     Parameters:
-        image: Optional artwork whose position is interpolated into the map.
+        image: Optional artwork to classify and place in the emotion map.
         neighbors: Number of neighbors used to build the graph and place a query.
         clusters: Number of spectral groups assigned from the KNN graph.
         output: Destination HTML file for the interactive plot.
-        seed: Random seed used by the spectral projection and clustering.
+        seed: Random seed used by spectral clustering.
         device: Whether to use CPU, CUDA, or automatic device selection.
 
     Returns:
@@ -150,6 +149,63 @@ def _joint_representation(
     return _normalize_rows(joined)
 
 
+def _class_affect_centroids(train_rows: pd.DataFrame, class_names: list[str]) -> FloatArray:
+    """Estimate valence and arousal for each emotion class from training labels.
+
+    Parameters:
+        train_rows: Training records with dominant emotion, valence, and arousal.
+        class_names: Ordered emotion vocabulary matching model output columns.
+
+    Returns:
+        Float32 matrix with one mean valence and arousal pair per emotion class.
+
+    Raises:
+        ValueError: If a class has no training records or target columns are
+            missing or outside the binary label range.
+    """
+    required_columns = {"dominant_emotion", "valence", "arousal"}
+    if not required_columns.issubset(train_rows.columns):
+        raise ValueError(f"Training split is missing target fields: {sorted(required_columns - set(train_rows.columns))}")
+    centroids: list[list[float]] = []
+    for emotion in class_names:
+        class_rows = train_rows.loc[train_rows["dominant_emotion"] == emotion]
+        if class_rows.empty:
+            raise ValueError(f"Training split has no valence/arousal labels for {emotion!r}")
+        values = class_rows[["valence", "arousal"]].to_numpy(dtype=np.float32)
+        if not np.isfinite(values).all() or ((values < 0.0) | (values > 1.0)).any():
+            raise ValueError(f"Valence or arousal values for {emotion!r} must be finite values in [0, 1]")
+        centroids.append(values.mean(axis=0).tolist())
+    return np.asarray(centroids, dtype=np.float32)
+
+
+def _emotion_coordinates(probabilities: FloatArray, class_affect: FloatArray) -> FloatArray:
+    """Map recognized emotion probabilities to valence, arousal, and confidence.
+
+    Parameters:
+        probabilities: Softmax matrix with one column for each emotion class.
+        class_affect: Training-derived mean valence and arousal for each class.
+
+    Returns:
+        Three-dimensional coordinates: estimated valence, estimated arousal,
+        and the model's maximum class probability.
+
+    Raises:
+        ValueError: If array dimensions disagree, values are non-finite, or
+            probabilities are outside [0, 1].
+    """
+    if probabilities.ndim != 2 or class_affect.ndim != 2 or class_affect.shape[1] != 2:
+        raise ValueError("Emotion probabilities and affect centroids must be matrices with two affect columns")
+    if probabilities.shape[1] != class_affect.shape[0]:
+        raise ValueError("The model probability count must match the number of emotion affect centroids")
+    if not np.isfinite(probabilities).all() or not np.isfinite(class_affect).all():
+        raise ValueError("Emotion probabilities and affect centroids must contain finite values")
+    if ((probabilities < 0.0) | (probabilities > 1.0)).any():
+        raise ValueError("Emotion probabilities must be in [0, 1]")
+    estimated_affect = probabilities @ class_affect
+    confidence = probabilities.max(axis=1, keepdims=True)
+    return np.concatenate((estimated_affect, confidence), axis=1).astype(np.float32)
+
+
 def _knn_graph(
     representations: FloatArray,
     neighbor_count: int,
@@ -196,20 +252,20 @@ def _knn_graph(
     return affinity, search
 
 
-def _embed_knn_space(
+def _cluster_knn_graph(
     affinity: sparse.csr_matrix,
     cluster_count: int,
     seed: int,
-) -> tuple[FloatArray, IntArray]:
-    """Project the KNN graph into 3D and assign graph-based emotion groups.
+) -> IntArray:
+    """Assign spectral clusters to artworks using their KNN affinity graph.
 
     Parameters:
         affinity: Sparse symmetric KNN similarity graph.
         cluster_count: Requested number of spectral emotion groups.
-        seed: Seed used by stochastic eigensolver and clustering steps.
+        seed: Seed used by spectral clustering.
 
     Returns:
-        Three-dimensional point coordinates and integer KNN cluster IDs.
+        Integer KNN cluster ID for each graph node.
 
     Raises:
         ValueError: If the graph or cluster count is invalid.
@@ -219,11 +275,6 @@ def _embed_knn_space(
         raise ValueError(f"Expected a square graph with at least four nodes; got {affinity.shape}")
     if cluster_count < 2 or cluster_count >= point_count:
         raise ValueError(f"cluster_count must be in [2, {point_count - 1}]")
-    embedding = SpectralEmbedding(
-        n_components=3,
-        affinity="precomputed",
-        random_state=seed,
-    ).fit_transform(affinity)
     clustering = SpectralClustering(
         n_clusters=cluster_count,
         affinity="precomputed",
@@ -231,56 +282,45 @@ def _embed_knn_space(
         random_state=seed,
     )
     cluster_ids = clustering.fit_predict(affinity)
-    return embedding.astype(np.float32), cluster_ids.astype(np.int64)
+    return cluster_ids.astype(np.int64)
 
 
-def _project_query(
+def _find_query_group(
     query_embedding: FloatArray,
     query_probabilities: FloatArray,
     reference_representation: FloatArray,
-    reference_coordinates: FloatArray,
     reference_clusters: IntArray,
     search: NearestNeighbors,
     neighbor_count: int,
-) -> tuple[FloatArray, int, IntArray]:
-    """Place a new artwork by weighted interpolation from its K nearest works.
+) -> tuple[int, IntArray]:
+    """Find the nearest known artworks and assign their majority KNN group.
 
     Parameters:
         query_embedding: CNN embedding for the new artwork, shape ``(1, d)``.
         query_probabilities: CNN emotion distribution, shape ``(1, c)``.
         reference_representation: Joint representation matrix for known works.
-        reference_coordinates: 3D KNN-map coordinates for known works.
         reference_clusters: KNN cluster IDs associated with known works.
         search: Fitted KNN search model for known works.
         neighbor_count: Number of known datapoints used to position the query.
 
     Returns:
-        Query's interpolated 3D coordinate, majority neighbor cluster, and
-        indices of the contributing known artworks.
+        Majority KNN group and indices of the nearest known artworks.
 
     Raises:
         ValueError: If query shapes are invalid or neighbor_count is invalid.
     """
     if query_embedding.shape[0] != 1 or query_probabilities.shape[0] != 1:
-        raise ValueError("A new-artwork projection accepts exactly one query image")
+        raise ValueError("KNN grouping accepts exactly one query image")
     query_representation = _joint_representation(query_embedding, query_probabilities)
     available = reference_representation.shape[0]
     if neighbor_count < 1 or neighbor_count > available:
         raise ValueError(f"Query neighbor_count must be in [1, {available}]")
-    distances, indices = search.kneighbors(query_representation, n_neighbors=neighbor_count)
-    selected_distances = distances[0]
+    _, indices = search.kneighbors(query_representation, n_neighbors=neighbor_count)
     selected_indices = indices[0]
-    exact = selected_distances <= 1e-8
-    if exact.any():
-        weights = exact.astype(np.float32)
-    else:
-        inverse_distances = 1.0 / np.maximum(selected_distances, 1e-8)
-        weights = (inverse_distances / inverse_distances.sum()).astype(np.float32)
-    coordinate = np.average(reference_coordinates[selected_indices], axis=0, weights=weights)
     neighbor_labels = reference_clusters[selected_indices]
     cluster_ids, cluster_counts = np.unique(neighbor_labels, return_counts=True)
     query_cluster = int(cluster_ids[np.argmax(cluster_counts)])
-    return coordinate.astype(np.float32), query_cluster, selected_indices.astype(np.int64)
+    return query_cluster, selected_indices.astype(np.int64)
 
 
 def _render_space(
@@ -294,16 +334,16 @@ def _render_space(
     query_cluster: int | None,
     query_label: str | None,
 ) -> None:
-    """Write a standalone mouse-rotatable Plotly 3D emotion map.
+    """Write a mouse-rotatable map with emotion-related coordinate axes.
 
     Parameters:
-        rows: Known artwork metadata aligned with coordinates.
-        coordinates: KNN-manifold coordinates for the known artworks.
+        rows: Known artwork metadata aligned with emotion coordinates.
+        coordinates: Estimated valence, arousal, and emotion confidence.
         clusters: Spectral KNN cluster IDs aligned with rows.
         predicted_emotions: Top CNN emotion prediction for each known artwork.
         probabilities: CNN class distributions aligned with rows.
         output_path: Destination HTML path.
-        query_point: Optional interpolated coordinate for one new artwork.
+        query_point: Optional valence/arousal/confidence for one query artwork.
         query_cluster: KNN group assigned to an optional query artwork.
         query_label: Display label for an optional query artwork.
 
@@ -317,13 +357,15 @@ def _render_space(
     """
     count = len(rows)
     if coordinates.shape != (count, 3) or clusters.shape[0] != count:
-        raise ValueError("Each known artwork must have one coordinate and cluster")
+        raise ValueError("Each known artwork must have one affect coordinate and KNN cluster")
     if len(predicted_emotions) != count or probabilities.shape[0] != count:
         raise ValueError("Each known artwork must have one prediction probability vector")
     hover_text = [
         f"<b>{Path(str(row.image_path)).name}</b><br>"
         f"Dataset emotion: {row.dominant_emotion}<br>"
         f"CNN recognition: {predicted_emotions[index]}<br>"
+        f"Estimated valence: {coordinates[index, 0]:.2f}<br>"
+        f"Estimated arousal: {coordinates[index, 1]:.2f}<br>"
         f"Style: {row.style}<br>Split: {row.split}<br>"
         f"KNN group: {int(clusters[index])}<br>"
         f"Recognition confidence: {float(probabilities[index].max()):.3f}"
@@ -357,18 +399,39 @@ def _render_space(
             mode="markers+text",
             text=[query_label],
             textposition="top center",
-            hovertemplate=f"{query_label}<br>KNN group: {query_cluster}<extra></extra>",
+            hovertemplate=(
+                f"{query_label}<br>"
+                f"Estimated valence: {query_point[0]:.2f}<br>"
+                f"Estimated arousal: {query_point[1]:.2f}<br>"
+                f"Emotion confidence: {query_point[2]:.3f}<br>"
+                f"KNN group: {query_cluster}<extra></extra>"
+            ),
             marker={"size": 9, "color": "#111827", "symbol": "diamond"},
-            name="New artwork, placed by KNN",
+            name="New artwork",
         ))
     figure.update_layout(
-        title="EmoArt emotion space from CNN recognition and KNN relationships",
+        title="Predicted artwork emotion: valence, arousal, and model confidence",
         template="plotly_white",
         scene={
-            "xaxis_title": "KNN manifold axis 1",
-            "yaxis_title": "KNN manifold axis 2",
-            "zaxis_title": "KNN manifold axis 3",
-            "aspectmode": "data",
+            "xaxis": {
+                "title": "Estimated positive valence",
+                "range": [0, 1],
+                "tickvals": [0, 1],
+                "ticktext": ["Negative", "Positive"],
+            },
+            "yaxis": {
+                "title": "Estimated arousal",
+                "range": [0, 1],
+                "tickvals": [0, 1],
+                "ticktext": ["Low", "High"],
+            },
+            "zaxis": {
+                "title": "Emotion prediction confidence",
+                "range": [0, 1],
+                "tickvals": [0, 0.5, 1],
+                "ticktext": ["Low", "Medium", "High"],
+            },
+            "aspectmode": "cube",
         },
         margin={"l": 0, "r": 0, "t": 55, "b": 0},
     )
@@ -451,7 +514,10 @@ def main() -> None:
     representations = _joint_representation(embeddings, probabilities)
     affinity, search = _knn_graph(representations, arguments.neighbors)
     cluster_count = min(arguments.clusters, len(known_rows) - 1)
-    coordinates, clusters = _embed_knn_space(affinity, cluster_count, arguments.seed)
+    train_rows = splits.loc[splits["split"] == "train"]
+    class_affect = _class_affect_centroids(train_rows, [str(name) for name in class_names])
+    coordinates = _emotion_coordinates(probabilities, class_affect)
+    clusters = _cluster_knn_graph(affinity, cluster_count, arguments.seed)
     top_indices = probabilities.argmax(axis=1)
     predicted_emotions = [class_names[int(index)] for index in top_indices]
     query_point: FloatArray | None = None
@@ -470,11 +536,11 @@ def main() -> None:
         query_embedding, query_probabilities = _extract_recognition(
             query_frame, model, emotion_to_index, device, 1
         )
-        query_point, query_cluster, _ = _project_query(
+        query_point = _emotion_coordinates(query_probabilities, class_affect)[0]
+        query_cluster, _ = _find_query_group(
             query_embedding,
             query_probabilities,
             representations,
-            coordinates,
             clusters,
             search,
             min(arguments.neighbors, len(known_rows)),
@@ -500,6 +566,8 @@ def main() -> None:
     output_frame["z"] = coordinates[:, 2]
     output_frame["knn_group"] = clusters
     output_frame["predicted_emotion"] = predicted_emotions
+    output_frame["estimated_valence"] = coordinates[:, 0]
+    output_frame["estimated_arousal"] = coordinates[:, 1]
     output_frame["emotion_confidence"] = probabilities.max(axis=1)
     csv_path = arguments.output.with_suffix(".csv")
     output_frame.to_csv(csv_path, index=False)
