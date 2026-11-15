@@ -14,11 +14,15 @@ any individual viewer's emotions. The FlyBrain implementation remains separate.
 3. The visualizer joins the normalized embedding and normalized emotion
    probabilities into one representation. K-nearest neighbors (KNN) create a
    similarity graph between artworks.
-4. Spectral embedding projects the neighbor graph into three dimensions, and
-   spectral clustering assigns KNN groups. The plotted axes are emergent map
-   coordinates; they are not hand-assigned valence/arousal coordinates.
-5. A new image is recognized by the CNN and placed near its nearest known
-   artworks with distance-weighted KNN interpolation.
+4. The horizontal and depth coordinates estimate positive valence and arousal.
+   For each emotion class, the visualizer calculates its average binary
+   valence/arousal labels in the training split, then weights those averages
+   by the CNN's full emotion probability distribution. The vertical coordinate
+   is the probability of the CNN's most likely emotion. Spectral clustering
+   over the KNN graph assigns the group shown by point color.
+5. A new image receives coordinates from the same emotion probabilities and
+   training-derived class averages. KNN assigns it the majority group among
+   its nearest known artworks.
 
 EmoArt's labels were produced for the dataset and do not stand in for a new
 human participant study. EmoArt's 3D location is a data visualization of model
@@ -144,14 +148,16 @@ python -m src.CNN.visualize --image path/to/artwork.jpg --neighbors 12 --device 
 Open `runs/visualization/emotion_space.html` in a browser. Drag to rotate,
 scroll to zoom, and hover over points for the image name, dataset emotion, CNN
 recognition, style, split, KNN group, and confidence. The KNN group is shown by
-point color. A new query is marked with a diamond and placed by inverse-distance
-weighted interpolation from its nearest neighbors. Coordinates and metadata
+point color. A new query is marked with a diamond. Coordinates and metadata
 are also saved to `emotion_space.csv`.
 
 The map uses only training and validation images as known points. The held-out
-test set stays out of this exploratory map. KNN and spectral clustering are
-unsupervised organization steps over the CNN representation and recognition
-probabilities; the 3D axis directions have no intrinsic psychological meaning.
+test set stays out of this exploratory map. Valence and arousal are indirect
+estimates based on training-set averages for each emotion category; confidence
+is the CNN's largest class probability. They describe model predictions from
+EmoArt labels, not measured reactions from an individual viewer or a validated
+simulation of Damasio's theory. KNN group colors summarize visual and emotion
+similarity in the CNN representation.
 
 ## Code structure
 
@@ -160,7 +166,7 @@ probabilities; the 3D axis directions have no intrinsic psychological meaning.
 - `src/CNN/train.py`: baseline training, grid tuning, validation selection,
   and final test metrics.
 - `src/CNN/predict.py`: emotion-label inference for one artwork.
-- `src/CNN/visualize.py`: KNN graph, 3D projection, clustering, and Plotly HTML.
+- `src/CNN/visualize.py`: emotion estimates, KNN grouping, and interactive 3D Plotly HTML.
 - `src/CNN/download_data.py`: Hugging Face archive download and safe extraction.
 - `src/Flybrain/`: separate FlyBrain project files.
 
